@@ -1,0 +1,86 @@
+lpv_mpc_node:
+  ros__parameters:
+    use_sim_time: true
+
+    # ── Reference line: the SINGLE place to choose which CSV to follow ──
+    # Bare name resolves to src/csv_data/<name>.csv (or give a full '/...' path).
+    #   'test_worldv5'          - raw centerline (has undrivable hairpins)
+    #   'test_worldv5_optimize' - optimized corner-cut racing line  <-- follow this
+    #   'test_worldv5_mincurv'  - my min-curvature line (parked)
+    reference_csv: 'test_worldv5_optimize'
+    # Lowered to 0.4: run the whole lap inside the linear-tire regime (slip small)
+    # so the MPC's model is valid and the car actually tracks. Raise once stable.
+    speed_scale: 0.40      # Scale waypoint speeds (start conservative, increase once stable)
+
+    # Drive-speed command (velocity setpoint sent to the sim servo).
+    #   speed_ff_blend    : 0 = pure MPC accel-integration, 1 = pure raceline
+    #                       feedforward. The feedforward commands the profiled
+    #                       CSV speed directly so the servo applies real effort.
+    #   cmd_accel_horizon : integration time [s] for the MPC accel term. Was
+    #                       hardcoded to Ts=0.02 (only +0.06 m/s/tick, which
+    #                       starved the servo); 0.15 gives up to +0.45 m/s/tick.
+    speed_ff_blend: 0.7
+    cmd_accel_horizon: 0.15
+
+    # Brake-lookahead: command the highest speed that can still brake (at
+    # speed_lookahead_decel m/s^2) down to every reference speed within
+    # speed_lookahead_time seconds ahead. Stops the car arriving at corners too
+    # hot. Increase lookahead_time if it still enters corners fast; lower decel
+    # to brake earlier/more conservatively.
+    speed_lookahead_time: 1.2
+    speed_lookahead_decel: 4.0
+
+    # Soft state constraints: slack on the state-limit rows so the QP is ALWAYS
+    # feasible -> the controller never freezes the steering mid-slide. Slack is
+    # penalised (L1 + L2); raise the penalties to hug the limits harder, lower
+    # them to let the car exceed limits more gracefully. Set soft_constraints
+    # false to revert to the old hard (can-be-infeasible) QP.
+    # Penalties raised 10x: the previous (low) values let the QP freely violate
+    # the lateral-velocity/slip limit, so the car slid/spun off the line. High
+    # penalties make it respect grip (won't casually slide) while still being
+    # always-feasible (never freezes the steering).
+    soft_constraints: true
+    slack_penalty_lin: 100000.0
+    slack_penalty_quad: 1000.0
+
+    # Per-run CSV debug log. Set enable_csv_log:false to turn off. log_dir is
+    # normally overridden by the launch file to src/lpv_mpc_gazebo/log; this default is
+    # only used when the node is run directly (ros2 run) without the launch.
+    enable_csv_log: true
+    # log_dir: '/home/jayesh/sim_gazebo/src/lpv_mpc_gazebo/log'
+
+    # ROS topics
+    odom_topic: '/ego_racecar/odom'
+    drive_topic: '/drive'
+
+    # QP solver ('cvxopt', 'osqp', 'ecos', 'scs')
+    qp_solver: 'osqp'
+
+    # The linearized model is discretized with classic RK4 (Taylor-4 of the
+    # matrix exponential). It is not configurable.
+
+    # MPC timing
+    Ts: 0.02              # Sample time [s] (50 Hz control loop)
+    hz: 30                # Prediction horizon [steps] (30 * 0.02s = 0.6s)
+
+    # F1Tenth vehicle parameters (from f110_gym simulator)
+    m: 3.74               # Mass [kg]
+    Iz: 0.04712           # Yaw moment of inertia [kg*m^2]
+    Cf: 123.0             # Front cornering stiffness [N/rad]
+    Cr: 131.0             # Rear cornering stiffness [N/rad]
+    lf: 0.15875           # CG to front axle [m]
+    lr: 0.17145           # CG to rear axle [m]
+    mju: 0.015            # Rolling resistance coefficient
+
+    # MPC cost weights (diagonal entries)
+    #   Q, S: output weights for [x_dot, psi, X, Y]
+    #   R:    input-rate weights for [d_delta, d_a]
+    #   Q/S: [x_dot_weight, psi_weight, X_weight, Y_weight]
+    #   R:   [d_delta_weight, d_accel_weight]
+    #   High x_dot weight → track CSV speed profile (slows for curves)
+    #   High psi weight   → follow heading (prevents oversteer/understeer)
+    #   Moderate X/Y      → follow position without oscillation
+    #   High R[0]         → smooth steering (prevents oscillation)
+    Q_diag: [500.0, 2500.0, 1500.0, 1500.0]
+    S_diag: [500.0, 2500.0, 1500.0, 1500.0]
+    R_diag: [55.0, 8.0]
