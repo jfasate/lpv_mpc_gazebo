@@ -10,7 +10,7 @@ lpv_mpc_node:
     reference_csv: 'test_worldv5_optimize'
     # Lowered to 0.4: run the whole lap inside the linear-tire regime (slip small)
     # so the MPC's model is valid and the car actually tracks. Raise once stable.
-    speed_scale: 1.00      # Scale waypoint speeds (increase in small steps once stable)
+    speed_scale: 0.90      # Scale waypoint speeds (increase in small steps once stable)
 
     # Drive-speed command (velocity setpoint sent to the sim servo).
     #   speed_ff_blend    : 0 = pure MPC accel-integration, 1 = pure raceline
@@ -20,6 +20,12 @@ lpv_mpc_node:
     #                       hardcoded to Ts=0.02 (only +0.06 m/s/tick, which
     #                       starved the servo); 0.15 gives up to +0.45 m/s/tick.
     speed_ff_blend: 0.0
+    adaptive_speed_ff_enabled: true
+    adaptive_speed_ff_blend_max: 0.40
+    adaptive_speed_ff_risk_start: 0.60
+    adaptive_speed_ff_slip_deg: 5.0
+    adaptive_speed_ff_clearance_soft: 1.30
+    adaptive_speed_ff_clearance_hard: 0.90
     cmd_accel_horizon: 0.15
 
     # Brake-lookahead: command the highest speed that can still brake (at
@@ -41,9 +47,12 @@ lpv_mpc_node:
     recovery_speed_cap: 3.4
     recovery_soft_accel_cap: 1.0
     recovery_accel_cap: 0.0
-    predictive_recovery_lat_growth: 2.0
-    predictive_recovery_lat_end: 3.5
-    predictive_recovery_heading_err_deg: 90.0
+    predictive_recovery_lat_growth: 0.85
+    predictive_recovery_lat_end: 1.00
+    predictive_recovery_heading_err_deg: 45.0
+    predictive_recovery_hard_lat_growth: 2.50
+    predictive_recovery_hard_lat_end: 3.00
+    predictive_recovery_hard_heading_err_deg: 85.0
 
     # Soft state constraints: slack on the state-limit rows so the QP is ALWAYS
     # feasible -> the controller never freezes the steering mid-slide. Slack is

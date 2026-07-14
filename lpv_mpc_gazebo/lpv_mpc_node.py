@@ -57,6 +57,12 @@ class LPVMPCNode(Node):
         self.declare_parameter('reference_csv', 'test_worldv5_optimize')
         self.declare_parameter('speed_scale', 1.0)
         self.declare_parameter('speed_ff_blend', 0.7)
+        self.declare_parameter('adaptive_speed_ff_enabled', True)
+        self.declare_parameter('adaptive_speed_ff_blend_max', 0.40)
+        self.declare_parameter('adaptive_speed_ff_risk_start', 0.60)
+        self.declare_parameter('adaptive_speed_ff_slip_deg', 5.0)
+        self.declare_parameter('adaptive_speed_ff_clearance_soft', 1.30)
+        self.declare_parameter('adaptive_speed_ff_clearance_hard', 0.90)
         self.declare_parameter('cmd_accel_horizon', 0.15)
         # Brake-lookahead: command the max speed that can still decelerate to
         # every upcoming reference speed within lookahead_time, using
@@ -72,9 +78,12 @@ class LPVMPCNode(Node):
         self.declare_parameter('recovery_speed_cap', 3.4)
         self.declare_parameter('recovery_soft_accel_cap', 1.0)
         self.declare_parameter('recovery_accel_cap', 0.0)
-        self.declare_parameter('predictive_recovery_lat_growth', 2.0)
-        self.declare_parameter('predictive_recovery_lat_end', 3.5)
-        self.declare_parameter('predictive_recovery_heading_err_deg', 90.0)
+        self.declare_parameter('predictive_recovery_lat_growth', 0.85)
+        self.declare_parameter('predictive_recovery_lat_end', 1.00)
+        self.declare_parameter('predictive_recovery_heading_err_deg', 45.0)
+        self.declare_parameter('predictive_recovery_hard_lat_growth', 2.50)
+        self.declare_parameter('predictive_recovery_hard_lat_end', 3.00)
+        self.declare_parameter('predictive_recovery_hard_heading_err_deg', 85.0)
         # Per-run CSV debug log. log_dir defaults to the source-tree log/ folder
         # so the recorded runs are easy to inspect after the fact.
         self.declare_parameter('enable_csv_log', True)
@@ -99,6 +108,7 @@ class LPVMPCNode(Node):
         self.declare_parameter('wall_brake_gain', 1.0)
         self.declare_parameter('wall_scan_max_age', 0.20)
         self.declare_parameter('obstacle_avoidance_enabled', True)
+        self.declare_parameter('obstacle_path_aware_enabled', True)
         self.declare_parameter('obstacle_forward_angle_deg', 55.0)
         self.declare_parameter('obstacle_corridor_width', 0.75)
         self.declare_parameter('obstacle_soft_distance', 3.00)
@@ -135,6 +145,18 @@ class LPVMPCNode(Node):
         reference_csv = self.get_parameter('reference_csv').value
         self.speed_scale = self.get_parameter('speed_scale').value
         self.speed_ff_blend = self.get_parameter('speed_ff_blend').value
+        self.adaptive_speed_ff_enabled = self.get_parameter(
+            'adaptive_speed_ff_enabled').value
+        self.adaptive_speed_ff_blend_max = self.get_parameter(
+            'adaptive_speed_ff_blend_max').value
+        self.adaptive_speed_ff_risk_start = self.get_parameter(
+            'adaptive_speed_ff_risk_start').value
+        self.adaptive_speed_ff_slip = math.radians(
+            self.get_parameter('adaptive_speed_ff_slip_deg').value)
+        self.adaptive_speed_ff_clearance_soft = self.get_parameter(
+            'adaptive_speed_ff_clearance_soft').value
+        self.adaptive_speed_ff_clearance_hard = self.get_parameter(
+            'adaptive_speed_ff_clearance_hard').value
         self.cmd_accel_horizon = self.get_parameter('cmd_accel_horizon').value
         self.speed_lookahead_time = self.get_parameter('speed_lookahead_time').value
         self.speed_lookahead_decel = self.get_parameter('speed_lookahead_decel').value
@@ -154,6 +176,12 @@ class LPVMPCNode(Node):
             'predictive_recovery_lat_end').value
         self.predictive_recovery_heading_err = math.radians(
             self.get_parameter('predictive_recovery_heading_err_deg').value)
+        self.predictive_recovery_hard_lat_growth = self.get_parameter(
+            'predictive_recovery_hard_lat_growth').value
+        self.predictive_recovery_hard_lat_end = self.get_parameter(
+            'predictive_recovery_hard_lat_end').value
+        self.predictive_recovery_hard_heading_err = math.radians(
+            self.get_parameter('predictive_recovery_hard_heading_err_deg').value)
         self.enable_csv_log = self.get_parameter('enable_csv_log').value
         self.log_dir = self.get_parameter('log_dir').value
         odom_topic = self.get_parameter('odom_topic').value
@@ -181,6 +209,8 @@ class LPVMPCNode(Node):
         self.wall_scan_max_age = self.get_parameter('wall_scan_max_age').value
         self.obstacle_avoidance_enabled = self.get_parameter(
             'obstacle_avoidance_enabled').value
+        self.obstacle_path_aware_enabled = self.get_parameter(
+            'obstacle_path_aware_enabled').value
         self.obstacle_forward_angle = math.radians(
             self.get_parameter('obstacle_forward_angle_deg').value)
         self.obstacle_corridor_width = self.get_parameter(
@@ -337,6 +367,7 @@ class LPVMPCNode(Node):
         self._last_wall_limit_active = False
         self._last_wall_limit_hard = False
         self._last_wall_source = ''
+        self._last_speed_ff_blend = self.speed_ff_blend
         self.iteration = 0
 
         # ── Warm-started OSQP solver state ──────────────────────────
@@ -524,7 +555,7 @@ class LPVMPCNode(Node):
         self._last_wall_limit_hard = guard['hard']
         self._last_wall_source = guard['source']
 
-    def _compute_wall_guard(self, current_speed=0.0):
+    def _compute_wall_guard(self, current_speed=0.0, path_heading=0.0):
         """LiDAR clearance speed guard, inspired by MPPI wall soft-hinge costs."""
         guard = self._inactive_wall_guard()
         if not self.wall_avoidance_enabled or not self.scan_received:
@@ -556,10 +587,23 @@ class LPVMPCNode(Node):
         obstacle_x = scan.get('obstacle_x')
         if (self.obstacle_avoidance_enabled
                 and obstacle_x is not None and math.isfinite(obstacle_x)):
-            candidates.append((
-                'obstacle', obstacle_x,
-                self.obstacle_soft_distance, self.obstacle_hard_distance,
-                self.obstacle_soft_speed_cap, self.obstacle_hard_speed_cap))
+            obstacle_y = scan.get('obstacle_y')
+            use_obstacle = True
+            if (self.obstacle_path_aware_enabled
+                    and obstacle_y is not None and math.isfinite(obstacle_y)
+                    and math.isfinite(path_heading)):
+                heading = float(np.clip(
+                    path_heading, -self.obstacle_forward_angle,
+                    self.obstacle_forward_angle))
+                path_y = obstacle_x * math.tan(heading)
+                path_lateral_error = obstacle_y - path_y
+                corridor_half_width = 0.5 * self.obstacle_corridor_width
+                use_obstacle = abs(path_lateral_error) <= corridor_half_width
+            if use_obstacle:
+                candidates.append((
+                    'obstacle', obstacle_x,
+                    self.obstacle_soft_distance, self.obstacle_hard_distance,
+                    self.obstacle_soft_speed_cap, self.obstacle_hard_speed_cap))
 
         if not candidates:
             return guard
@@ -607,6 +651,59 @@ class LPVMPCNode(Node):
             return min(speed_cmd, cap - brake_gain * (current_speed - cap))
         return min(speed_cmd, cap)
 
+    def _adaptive_speed_ff_blend(self, lat_err, heading_err, pred_lat_growth,
+                                 pred_lat_end, pred_heading_peak, slip,
+                                 wall_guard, recovery_active,
+                                 hard_recovery_active):
+        if not self.adaptive_speed_ff_enabled:
+            return float(self.speed_ff_blend)
+        if hard_recovery_active:
+            return float(self.speed_ff_blend)
+
+        base = float(self.speed_ff_blend)
+        max_blend = max(base, float(self.adaptive_speed_ff_blend_max))
+        risk_start = float(np.clip(self.adaptive_speed_ff_risk_start, 0.0, 0.99))
+
+        pred_risk = max(
+            max(pred_lat_growth, 0.0) / max(self.predictive_recovery_lat_growth, 1e-3),
+            pred_lat_end / max(self.predictive_recovery_lat_end, 1e-3),
+            pred_heading_peak / max(self.predictive_recovery_heading_err, 1e-3))
+        current_risk = max(
+            abs(lat_err) / max(self.recovery_lat_err, 1e-3),
+            abs(heading_err) / max(self.recovery_heading_err, 1e-3))
+        slip_risk = abs(slip) / max(self.adaptive_speed_ff_slip, 1e-3)
+
+        clearance_risk = 0.0
+        clearances = []
+        source = wall_guard.get('source', '')
+        if source in ('side', 'front'):
+            clearance = wall_guard.get('clearance', float('nan'))
+            if math.isfinite(clearance):
+                clearances.append(clearance)
+        scan = self._scan_metrics_for_log()
+        for key in ('min', 'left_min', 'right_min', 'front_min'):
+            value = scan.get(key, float('nan'))
+            if math.isfinite(value):
+                clearances.append(value)
+        if clearances:
+            clearance = min(clearances)
+            denom = max(self.adaptive_speed_ff_clearance_soft
+                        - self.adaptive_speed_ff_clearance_hard, 1e-3)
+            clearance_risk = float(np.clip(
+                (self.adaptive_speed_ff_clearance_soft - clearance) / denom,
+                0.0, 1.0))
+
+        risk = max(pred_risk, current_risk, slip_risk, clearance_risk)
+        if recovery_active:
+            risk = max(risk, 1.0)
+        if risk <= risk_start:
+            scale = 1.0
+        elif risk >= 1.0:
+            scale = 0.0
+        else:
+            scale = (1.0 - risk) / max(1.0 - risk_start, 1e-3)
+        return float(base + (max_blend - base) * scale)
+
     # ────────────────────────────────────────────────────────────────
     #  Main control loop (timer callback)
     # ───────────────────────────────────────────���────────────────────
@@ -653,6 +750,9 @@ class LPVMPCNode(Node):
         # coasting at the current speed, which used to cancel braking exactly
         # at hard corner entries where the QP is most likely infeasible).
         ff_ref_speed = self._lookahead_ref_speed(wp_idx, states[0])
+        path_heading = math.atan2(
+            math.sin(float(r[1]) - states[2]),
+            math.cos(float(r[1]) - states[2]))
 
         # ── 3. Linearize & build QP ───────────────────────────���────
         t_build_start = time.perf_counter()
@@ -693,7 +793,7 @@ class LPVMPCNode(Node):
                         f'min_slack={slack.min():.4f}')
                 # Brake toward the reference (do NOT coast at current speed).
                 brake_cmd = min(states[0], ff_ref_speed)
-                wall_guard = self._compute_wall_guard(states[0])
+                wall_guard = self._compute_wall_guard(states[0], path_heading)
                 self._record_wall_guard(wall_guard)
                 brake_cmd = self._apply_wall_guard_to_speed(
                     brake_cmd, states[0], wall_guard)
@@ -706,7 +806,7 @@ class LPVMPCNode(Node):
             if self.iteration % 50 == 0:
                 self.get_logger().warn(f'QP exception: {e}  states={np.round(states, 3)}')
             brake_cmd = min(states[0], ff_ref_speed)
-            wall_guard = self._compute_wall_guard(states[0])
+            wall_guard = self._compute_wall_guard(states[0], path_heading)
             self._record_wall_guard(wall_guard)
             brake_cmd = self._apply_wall_guard_to_speed(
                 brake_cmd, states[0], wall_guard)
@@ -771,14 +871,18 @@ class LPVMPCNode(Node):
             pred_lat_growth > self.predictive_recovery_lat_growth
             or pred_lat_end > self.predictive_recovery_lat_end
             or pred_heading_peak > self.predictive_recovery_heading_err)
+        predictive_hard_recovery_active = (
+            pred_lat_growth > self.predictive_recovery_hard_lat_growth
+            or pred_lat_end > self.predictive_recovery_hard_lat_end
+            or pred_heading_peak > self.predictive_recovery_hard_heading_err)
         recovery_active = recovery_active or predictive_recovery_active
-        hard_recovery_active = hard_recovery_active or predictive_recovery_active
+        hard_recovery_active = hard_recovery_active or predictive_hard_recovery_active
         if recovery_active:
             accel_limit = (self.recovery_accel_cap if hard_recovery_active
                            else self.recovery_soft_accel_cap)
             self.U2 = min(self.U2, accel_limit)
 
-        wall_guard = self._compute_wall_guard(states[0])
+        wall_guard = self._compute_wall_guard(states[0], path_heading)
         if wall_guard['active']:
             self.U2 = min(self.U2, self.wall_accel_cap)
         self._record_wall_guard(wall_guard)
@@ -797,9 +901,16 @@ class LPVMPCNode(Node):
         if self.U2 < -0.5 and states[0] > ref_speed:
             # Car is faster than reference → brake hard using reverse
             speed_cmd = ref_speed - (states[0] - ref_speed)
+            speed_ff_blend = 0.0
         else:
-            speed_cmd = (self.speed_ff_blend * ref_speed
-                         + (1.0 - self.speed_ff_blend) * mpc_speed)
+            slip = math.atan2(states[1], states[0]) if abs(states[0]) > 1e-3 else 0.0
+            speed_ff_blend = self._adaptive_speed_ff_blend(
+                lat_err, heading_err, pred_lat_growth, pred_lat_end,
+                pred_heading_peak, slip, wall_guard, recovery_active,
+                hard_recovery_active)
+            speed_cmd = (speed_ff_blend * ref_speed
+                         + (1.0 - speed_ff_blend) * mpc_speed)
+        self._last_speed_ff_blend = speed_ff_blend
         if recovery_active:
             cap = (self.recovery_speed_cap if hard_recovery_active
                    else self.recovery_soft_speed_cap)
@@ -1076,7 +1187,7 @@ class LPVMPCNode(Node):
         'sq_err_v', 'sq_pos_err', 'mse_v', 'mse_pos',
         # control
         'steer_deg', 'accel', 'du_steer', 'du_accel',
-        'speed_cmd', 'ref_speed_ff', 'mpc_speed',
+        'speed_cmd', 'ref_speed_ff', 'mpc_speed', 'speed_ff_blend_used',
         # timing (ms)
         't_build_ms', 't_solve_ms',
         # full horizons as space-separated scalar series
@@ -1192,6 +1303,7 @@ class LPVMPCNode(Node):
             R(math.degrees(self.U1), 3), R(self.U2),
             R(float(self.du[0][0])), R(float(self.du[1][0])),
             R(speed_cmd), R(ref_speed), R(mpc_speed),
+            R(self._last_speed_ff_blend, 3),
             R(t_build * 1e3, 3), R(t_solve * 1e3, 3),
             ref_horizon_vx, ref_horizon_psi, ref_horizon_X, ref_horizon_Y,
             pred_horizon_vx, pred_horizon_psi, pred_horizon_X, pred_horizon_Y,
