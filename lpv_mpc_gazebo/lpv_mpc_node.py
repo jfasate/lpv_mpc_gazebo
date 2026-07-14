@@ -36,6 +36,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import LaserScan
 from ackermann_msgs.msg import AckermannDriveStamped
 from geometry_msgs.msg import Point
 from visualization_msgs.msg import Marker
@@ -63,6 +64,17 @@ class LPVMPCNode(Node):
         # at a corner too hot (the trigger of the lap-1 spin-out).
         self.declare_parameter('speed_lookahead_time', 1.2)
         self.declare_parameter('speed_lookahead_decel', 4.0)
+        self.declare_parameter('recovery_lat_err', 0.8)
+        self.declare_parameter('recovery_heading_err_deg', 30.0)
+        self.declare_parameter('recovery_hard_lat_err', 2.0)
+        self.declare_parameter('recovery_hard_heading_err_deg', 60.0)
+        self.declare_parameter('recovery_soft_speed_cap', 4.8)
+        self.declare_parameter('recovery_speed_cap', 3.4)
+        self.declare_parameter('recovery_soft_accel_cap', 1.0)
+        self.declare_parameter('recovery_accel_cap', 0.0)
+        self.declare_parameter('predictive_recovery_lat_growth', 2.0)
+        self.declare_parameter('predictive_recovery_lat_end', 3.5)
+        self.declare_parameter('predictive_recovery_heading_err_deg', 90.0)
         # Per-run CSV debug log. log_dir defaults to the source-tree log/ folder
         # so the recorded runs are easy to inspect after the fact.
         self.declare_parameter('enable_csv_log', True)
@@ -70,7 +82,33 @@ class LPVMPCNode(Node):
             'log_dir',
             os.path.expanduser('~/sim_gazebo/src/lpv_mpc_gazebo/log'))
         self.declare_parameter('odom_topic', '/ego_racecar/odom')
+        self.declare_parameter('scan_topic', '/scan')
         self.declare_parameter('drive_topic', '/drive')
+        self.declare_parameter('scan_front_angle_deg', 0.0)
+        self.declare_parameter('scan_left_angle_deg', 90.0)
+        self.declare_parameter('scan_right_angle_deg', -90.0)
+        self.declare_parameter('scan_sector_width_deg', 10.0)
+        self.declare_parameter('wall_avoidance_enabled', True)
+        self.declare_parameter('wall_soft_clearance', 0.75)
+        self.declare_parameter('wall_hard_clearance', 0.40)
+        self.declare_parameter('wall_front_soft_clearance', 1.50)
+        self.declare_parameter('wall_front_hard_clearance', 0.60)
+        self.declare_parameter('wall_soft_speed_cap', 4.8)
+        self.declare_parameter('wall_hard_speed_cap', 2.0)
+        self.declare_parameter('wall_accel_cap', 0.0)
+        self.declare_parameter('wall_brake_gain', 1.0)
+        self.declare_parameter('wall_scan_max_age', 0.20)
+        self.declare_parameter('obstacle_avoidance_enabled', True)
+        self.declare_parameter('obstacle_forward_angle_deg', 55.0)
+        self.declare_parameter('obstacle_corridor_width', 0.75)
+        self.declare_parameter('obstacle_soft_distance', 3.00)
+        self.declare_parameter('obstacle_hard_distance', 0.90)
+        self.declare_parameter('obstacle_soft_speed_cap', 6.8)
+        self.declare_parameter('obstacle_hard_speed_cap', 1.5)
+        self.declare_parameter('obstacle_ttc_soft', 1.35)
+        self.declare_parameter('obstacle_ttc_hard', 0.75)
+        self.declare_parameter('obstacle_brake_gain', 0.6)
+        self.declare_parameter('config_file', '')
         self.declare_parameter('Ts', 0.02)
         self.declare_parameter('hz', 10)
         self.declare_parameter('m', 3.47)
@@ -80,6 +118,8 @@ class LPVMPCNode(Node):
         self.declare_parameter('lf', 0.15875)
         self.declare_parameter('lr', 0.17145)
         self.declare_parameter('mju', 0.015)
+        self.declare_parameter('steer_rate_limit', 3.2)
+        self.declare_parameter('d_a_max', 0.5)
         self.declare_parameter('Q_diag', [10.0, 500.0, 100.0, 100.0])
         self.declare_parameter('S_diag', [10.0, 500.0, 100.0, 100.0])
         self.declare_parameter('R_diag', [50.0, 5.0])
@@ -98,10 +138,65 @@ class LPVMPCNode(Node):
         self.cmd_accel_horizon = self.get_parameter('cmd_accel_horizon').value
         self.speed_lookahead_time = self.get_parameter('speed_lookahead_time').value
         self.speed_lookahead_decel = self.get_parameter('speed_lookahead_decel').value
+        self.recovery_lat_err = self.get_parameter('recovery_lat_err').value
+        self.recovery_heading_err = math.radians(
+            self.get_parameter('recovery_heading_err_deg').value)
+        self.recovery_hard_lat_err = self.get_parameter('recovery_hard_lat_err').value
+        self.recovery_hard_heading_err = math.radians(
+            self.get_parameter('recovery_hard_heading_err_deg').value)
+        self.recovery_soft_speed_cap = self.get_parameter('recovery_soft_speed_cap').value
+        self.recovery_speed_cap = self.get_parameter('recovery_speed_cap').value
+        self.recovery_soft_accel_cap = self.get_parameter('recovery_soft_accel_cap').value
+        self.recovery_accel_cap = self.get_parameter('recovery_accel_cap').value
+        self.predictive_recovery_lat_growth = self.get_parameter(
+            'predictive_recovery_lat_growth').value
+        self.predictive_recovery_lat_end = self.get_parameter(
+            'predictive_recovery_lat_end').value
+        self.predictive_recovery_heading_err = math.radians(
+            self.get_parameter('predictive_recovery_heading_err_deg').value)
         self.enable_csv_log = self.get_parameter('enable_csv_log').value
         self.log_dir = self.get_parameter('log_dir').value
         odom_topic = self.get_parameter('odom_topic').value
+        scan_topic = self.get_parameter('scan_topic').value
         drive_topic = self.get_parameter('drive_topic').value
+        self.scan_front_angle = math.radians(
+            self.get_parameter('scan_front_angle_deg').value)
+        self.scan_left_angle = math.radians(
+            self.get_parameter('scan_left_angle_deg').value)
+        self.scan_right_angle = math.radians(
+            self.get_parameter('scan_right_angle_deg').value)
+        self.scan_sector_width = math.radians(
+            self.get_parameter('scan_sector_width_deg').value)
+        self.wall_avoidance_enabled = self.get_parameter('wall_avoidance_enabled').value
+        self.wall_soft_clearance = self.get_parameter('wall_soft_clearance').value
+        self.wall_hard_clearance = self.get_parameter('wall_hard_clearance').value
+        self.wall_front_soft_clearance = self.get_parameter(
+            'wall_front_soft_clearance').value
+        self.wall_front_hard_clearance = self.get_parameter(
+            'wall_front_hard_clearance').value
+        self.wall_soft_speed_cap = self.get_parameter('wall_soft_speed_cap').value
+        self.wall_hard_speed_cap = self.get_parameter('wall_hard_speed_cap').value
+        self.wall_accel_cap = self.get_parameter('wall_accel_cap').value
+        self.wall_brake_gain = self.get_parameter('wall_brake_gain').value
+        self.wall_scan_max_age = self.get_parameter('wall_scan_max_age').value
+        self.obstacle_avoidance_enabled = self.get_parameter(
+            'obstacle_avoidance_enabled').value
+        self.obstacle_forward_angle = math.radians(
+            self.get_parameter('obstacle_forward_angle_deg').value)
+        self.obstacle_corridor_width = self.get_parameter(
+            'obstacle_corridor_width').value
+        self.obstacle_soft_distance = self.get_parameter(
+            'obstacle_soft_distance').value
+        self.obstacle_hard_distance = self.get_parameter(
+            'obstacle_hard_distance').value
+        self.obstacle_soft_speed_cap = self.get_parameter(
+            'obstacle_soft_speed_cap').value
+        self.obstacle_hard_speed_cap = self.get_parameter(
+            'obstacle_hard_speed_cap').value
+        self.obstacle_ttc_soft = self.get_parameter('obstacle_ttc_soft').value
+        self.obstacle_ttc_hard = self.get_parameter('obstacle_ttc_hard').value
+        self.obstacle_brake_gain = self.get_parameter('obstacle_brake_gain').value
+        config_file = self.get_parameter('config_file').value
         self.qp_solver = self.get_parameter('qp_solver').value
         self.soft_constraints = self.get_parameter('soft_constraints').value
         self.slack_rho = self.get_parameter('slack_penalty_lin').value
@@ -120,6 +215,8 @@ class LPVMPCNode(Node):
             'lf': self.get_parameter('lf').value,
             'lr': self.get_parameter('lr').value,
             'mju': self.get_parameter('mju').value,
+            'steer_rate_limit': self.get_parameter('steer_rate_limit').value,
+            'd_a_max': self.get_parameter('d_a_max').value,
             'Q_diag': list(self.get_parameter('Q_diag').value),
             'S_diag': list(self.get_parameter('S_diag').value),
             'R_diag': list(self.get_parameter('R_diag').value),
@@ -219,6 +316,27 @@ class LPVMPCNode(Node):
         self.U2 = 0.0               # current acceleration (a)
         self.du = np.zeros((self.inputs * self.hz, 1))
         self.state_received = False
+        self.scan_received = False
+        self.last_scan_time = None
+        self.scan_metrics = {
+            'front': float('nan'),
+            'left': float('nan'),
+            'right': float('nan'),
+            'front_min': float('nan'),
+            'left_min': float('nan'),
+            'right_min': float('nan'),
+            'min': float('nan'),
+            'age': float('nan'),
+            'obstacle_front': float('nan'),
+            'obstacle_x': float('nan'),
+            'obstacle_y': float('nan'),
+            'obstacle_bearing': float('nan'),
+        }
+        self._last_wall_clearance = float('nan')
+        self._last_wall_speed_cap = float('nan')
+        self._last_wall_limit_active = False
+        self._last_wall_limit_hard = False
+        self._last_wall_source = ''
         self.iteration = 0
 
         # ── Warm-started OSQP solver state ──────────────────────────
@@ -256,6 +374,8 @@ class LPVMPCNode(Node):
         odom_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.odom_sub = self.create_subscription(
             Odometry, odom_topic, self.odom_callback, odom_qos)
+        self.scan_sub = self.create_subscription(
+            LaserScan, scan_topic, self.scan_callback, odom_qos)
 
         self.drive_pub = self.create_publisher(AckermannDriveStamped, drive_topic, 1)
 
@@ -274,6 +394,11 @@ class LPVMPCNode(Node):
             f'solver={self.qp_solver}  disc=rk4  '
             f'speed_scale={self.speed_scale}  '
             f'ff_blend={self.speed_ff_blend}  cmd_horizon={self.cmd_accel_horizon}s')
+        self.get_logger().info(f'LPV-MPC code file: {__file__}')
+        self.get_logger().info(f'LPV-MPC config file: {config_file}')
+        self.get_logger().info(
+            'RViz topics: /lpv_mpc_gazebo/waypoints, '
+            '/lpv_mpc_gazebo/ref_traj, /lpv_mpc_gazebo/pred_path')
 
         # ── Per-run CSV debug log ───────────────────────────────────
         self._init_csv_log()
@@ -303,6 +428,185 @@ class LPVMPCNode(Node):
         self.states = np.array([x_dot, y_dot, yaw, psi_dot, X, Y])
         self.state_received = True
 
+    def scan_callback(self, msg):
+        """Store wall-clearance metrics from the latest LaserScan."""
+        ranges = np.asarray(msg.ranges, dtype=float)
+        valid = (
+            np.isfinite(ranges)
+            & (ranges >= msg.range_min)
+            & (ranges <= msg.range_max))
+
+        def beam_at(angle):
+            if angle < msg.angle_min or angle > msg.angle_max:
+                return float('nan')
+            idx = int(round((angle - msg.angle_min) / msg.angle_increment))
+            if idx < 0 or idx >= ranges.size or not valid[idx]:
+                return float('nan')
+            return float(ranges[idx])
+
+        def sector_min(angle):
+            half_width = 0.5 * self.scan_sector_width
+            lo = max(angle - half_width, msg.angle_min)
+            hi = min(angle + half_width, msg.angle_max)
+            if lo > hi:
+                return float('nan')
+            i0 = max(0, int(math.floor((lo - msg.angle_min) / msg.angle_increment)))
+            i1 = min(ranges.size - 1,
+                     int(math.ceil((hi - msg.angle_min) / msg.angle_increment)))
+            sector = ranges[i0:i1 + 1]
+            sector_valid = valid[i0:i1 + 1]
+            if not np.any(sector_valid):
+                return float('nan')
+            return float(np.min(sector[sector_valid]))
+
+        if np.any(valid):
+            scan_min = float(np.min(ranges[valid]))
+        else:
+            scan_min = float('nan')
+
+        angles = msg.angle_min + np.arange(ranges.size) * msg.angle_increment
+        xs = ranges * np.cos(angles)
+        ys = ranges * np.sin(angles)
+        corridor_half_width = 0.5 * self.obstacle_corridor_width
+        obstacle_mask = (
+            valid
+            & (xs > 0.0)
+            & (np.abs(ys) <= corridor_half_width)
+            & (np.abs(angles) <= self.obstacle_forward_angle))
+        if self.obstacle_avoidance_enabled and np.any(obstacle_mask):
+            obstacle_idxs = np.flatnonzero(obstacle_mask)
+            nearest_local_idx = int(np.argmin(xs[obstacle_idxs]))
+            obstacle_idx = int(obstacle_idxs[nearest_local_idx])
+            obstacle_front = float(ranges[obstacle_idx])
+            obstacle_x = float(xs[obstacle_idx])
+            obstacle_y = float(ys[obstacle_idx])
+            obstacle_bearing = float(angles[obstacle_idx])
+        else:
+            obstacle_front = obstacle_x = obstacle_y = obstacle_bearing = float('nan')
+
+        self.scan_metrics = {
+            'front': beam_at(self.scan_front_angle),
+            'left': beam_at(self.scan_left_angle),
+            'right': beam_at(self.scan_right_angle),
+            'front_min': sector_min(self.scan_front_angle),
+            'left_min': sector_min(self.scan_left_angle),
+            'right_min': sector_min(self.scan_right_angle),
+            'min': scan_min,
+            'age': 0.0,
+            'obstacle_front': obstacle_front,
+            'obstacle_x': obstacle_x,
+            'obstacle_y': obstacle_y,
+            'obstacle_bearing': obstacle_bearing,
+        }
+        self.last_scan_time = self.get_clock().now().nanoseconds * 1e-9
+        self.scan_received = True
+
+    def _scan_metrics_for_log(self):
+        scan = dict(self.scan_metrics)
+        if self.scan_received and self.last_scan_time is not None:
+            now = self.get_clock().now().nanoseconds * 1e-9
+            scan['age'] = max(0.0, now - self.last_scan_time)
+        return scan
+
+    def _inactive_wall_guard(self):
+        return {
+            'active': False,
+            'hard': False,
+            'clearance': float('nan'),
+            'speed_cap': float('nan'),
+            'source': '',
+        }
+
+    def _record_wall_guard(self, guard):
+        self._last_wall_clearance = guard['clearance']
+        self._last_wall_speed_cap = guard['speed_cap']
+        self._last_wall_limit_active = guard['active']
+        self._last_wall_limit_hard = guard['hard']
+        self._last_wall_source = guard['source']
+
+    def _compute_wall_guard(self, current_speed=0.0):
+        """LiDAR clearance speed guard, inspired by MPPI wall soft-hinge costs."""
+        guard = self._inactive_wall_guard()
+        if not self.wall_avoidance_enabled or not self.scan_received:
+            return guard
+
+        scan = self._scan_metrics_for_log()
+        age = scan.get('age', float('nan'))
+        if math.isfinite(age) and age > self.wall_scan_max_age:
+            return guard
+
+        candidates = []
+        side_vals = [
+            v for v in (scan.get('left_min'), scan.get('right_min'))
+            if v is not None and math.isfinite(v)
+        ]
+        if side_vals:
+            candidates.append((
+                'side', min(side_vals),
+                self.wall_soft_clearance, self.wall_hard_clearance,
+                self.wall_soft_speed_cap, self.wall_hard_speed_cap))
+
+        front = scan.get('front_min')
+        if front is not None and math.isfinite(front):
+            candidates.append((
+                'front', front,
+                self.wall_front_soft_clearance, self.wall_front_hard_clearance,
+                self.wall_soft_speed_cap, self.wall_hard_speed_cap))
+
+        obstacle_x = scan.get('obstacle_x')
+        if (self.obstacle_avoidance_enabled
+                and obstacle_x is not None and math.isfinite(obstacle_x)):
+            candidates.append((
+                'obstacle', obstacle_x,
+                self.obstacle_soft_distance, self.obstacle_hard_distance,
+                self.obstacle_soft_speed_cap, self.obstacle_hard_speed_cap))
+
+        if not candidates:
+            return guard
+
+        scored = []
+        for source, clearance, soft, hard, soft_cap, hard_cap in candidates:
+            denom = max(soft - hard, 1e-3)
+            distance_risk = float(np.clip((soft - clearance) / denom, 0.0, 1.0))
+            risk = distance_risk
+            if source == 'obstacle':
+                ttc = clearance / max(float(current_speed), 0.1)
+                ttc_denom = max(self.obstacle_ttc_soft - self.obstacle_ttc_hard, 1e-3)
+                ttc_risk = float(np.clip(
+                    (self.obstacle_ttc_soft - ttc) / ttc_denom, 0.0, 1.0))
+                risk = max(distance_risk, ttc_risk)
+            scored.append((risk, clearance, source, soft, hard, soft_cap, hard_cap))
+
+        if any(risk > 0.0 for risk, *_ in scored):
+            risk, clearance, source, soft, hard, soft_cap, hard_cap = max(
+                scored, key=lambda item: (item[0], -item[1]))
+        else:
+            risk, clearance, source, soft, hard, soft_cap, hard_cap = min(
+                scored, key=lambda item: item[1])
+        guard['clearance'] = clearance
+        guard['source'] = source
+        if risk <= 0.0:
+            return guard
+
+        guard['speed_cap'] = (
+            (1.0 - risk) * soft_cap
+            + risk * hard_cap)
+        guard['active'] = True
+        guard['hard'] = clearance <= hard
+        return guard
+
+    def _apply_wall_guard_to_speed(self, speed_cmd, current_speed, guard):
+        if not guard['active'] or not math.isfinite(guard['speed_cap']):
+            return speed_cmd
+
+        cap = guard['speed_cap']
+        if guard['hard'] and current_speed > cap:
+            brake_gain = (self.obstacle_brake_gain
+                          if guard.get('source') == 'obstacle'
+                          else self.wall_brake_gain)
+            return min(speed_cmd, cap - brake_gain * (current_speed - cap))
+        return min(speed_cmd, cap)
+
     # ────────────────────────────────────────────────────────────────
     #  Main control loop (timer callback)
     # ───────────────────────────────────────────���────────────────────
@@ -312,6 +616,7 @@ class LPVMPCNode(Node):
 
         t_loop_start = time.perf_counter()
         states = self.states.copy()
+        self._record_wall_guard(self._inactive_wall_guard())
 
         # Ensure minimum forward velocity for the dynamic model.
         # The dynamic bicycle model is numerically unstable (forward-Euler)
@@ -388,6 +693,10 @@ class LPVMPCNode(Node):
                         f'min_slack={slack.min():.4f}')
                 # Brake toward the reference (do NOT coast at current speed).
                 brake_cmd = min(states[0], ff_ref_speed)
+                wall_guard = self._compute_wall_guard(states[0])
+                self._record_wall_guard(wall_guard)
+                brake_cmd = self._apply_wall_guard_to_speed(
+                    brake_cmd, states[0], wall_guard)
                 self._publish_drive(self.U1, brake_cmd)
                 self._log_row('qp_infeasible', states, wp_idx, r,
                               speed_cmd=brake_cmd, ref_speed=ff_ref_speed, t_build=t_build)
@@ -397,6 +706,10 @@ class LPVMPCNode(Node):
             if self.iteration % 50 == 0:
                 self.get_logger().warn(f'QP exception: {e}  states={np.round(states, 3)}')
             brake_cmd = min(states[0], ff_ref_speed)
+            wall_guard = self._compute_wall_guard(states[0])
+            self._record_wall_guard(wall_guard)
+            brake_cmd = self._apply_wall_guard_to_speed(
+                brake_cmd, states[0], wall_guard)
             self._publish_drive(self.U1, brake_cmd)
             self._log_row('qp_exception', states, wp_idx, r,
                           speed_cmd=brake_cmd, ref_speed=ff_ref_speed, t_build=t_build)
@@ -416,6 +729,60 @@ class LPVMPCNode(Node):
         accel_cap = min(3.0, 0.5 + 0.6 * max(states[0], 1.5))
         self.U2 = np.clip(self.U2, -3.0, accel_cap)
 
+        pred_aug = (Adc @ x_aug_t + Cdb @ self.du).flatten()
+
+        ref_psi = float(r[1])
+        err_X = states[4] - float(r[2])
+        err_Y = states[5] - float(r[3])
+        lat_err = -math.sin(ref_psi) * err_X + math.cos(ref_psi) * err_Y
+        heading_err = math.atan2(
+            math.sin(states[2] - ref_psi),
+            math.cos(states[2] - ref_psi))
+        recovery_active = (
+            abs(lat_err) > self.recovery_lat_err
+            or abs(heading_err) > self.recovery_heading_err)
+        hard_recovery_active = (
+            abs(lat_err) > self.recovery_hard_lat_err
+            or abs(heading_err) > self.recovery_hard_heading_err)
+
+        n_aug = 6 + self.inputs
+        pred_lat = []
+        pred_heading_err = []
+        for k in range(hz):
+            p0 = n_aug * k
+            r0 = self.outputs * k
+            pred_X = float(pred_aug[p0 + 4])
+            pred_Y = float(pred_aug[p0 + 5])
+            pred_psi = float(pred_aug[p0 + 2])
+            ref_psi_k = float(r[r0 + 1])
+            err_X_k = pred_X - float(r[r0 + 2])
+            err_Y_k = pred_Y - float(r[r0 + 3])
+            pred_lat.append(
+                -math.sin(ref_psi_k) * err_X_k
+                + math.cos(ref_psi_k) * err_Y_k)
+            pred_heading_err.append(math.atan2(
+                math.sin(pred_psi - ref_psi_k),
+                math.cos(pred_psi - ref_psi_k)))
+        pred_lat_start = abs(pred_lat[0]) if pred_lat else abs(lat_err)
+        pred_lat_end = abs(pred_lat[-1]) if pred_lat else abs(lat_err)
+        pred_lat_growth = pred_lat_end - pred_lat_start
+        pred_heading_peak = max((abs(e) for e in pred_heading_err), default=abs(heading_err))
+        predictive_recovery_active = (
+            pred_lat_growth > self.predictive_recovery_lat_growth
+            or pred_lat_end > self.predictive_recovery_lat_end
+            or pred_heading_peak > self.predictive_recovery_heading_err)
+        recovery_active = recovery_active or predictive_recovery_active
+        hard_recovery_active = hard_recovery_active or predictive_recovery_active
+        if recovery_active:
+            accel_limit = (self.recovery_accel_cap if hard_recovery_active
+                           else self.recovery_soft_accel_cap)
+            self.U2 = min(self.U2, accel_limit)
+
+        wall_guard = self._compute_wall_guard(states[0])
+        if wall_guard['active']:
+            self.U2 = min(self.U2, self.wall_accel_cap)
+        self._record_wall_guard(wall_guard)
+
         # Compute desired speed (a velocity setpoint for the sim servo).
         # Feedforward the profiled raceline speed instead of anchoring the
         # command to measured velocity + one tiny Ts accel step (which starved
@@ -433,15 +800,27 @@ class LPVMPCNode(Node):
         else:
             speed_cmd = (self.speed_ff_blend * ref_speed
                          + (1.0 - self.speed_ff_blend) * mpc_speed)
+        if recovery_active:
+            cap = (self.recovery_speed_cap if hard_recovery_active
+                   else self.recovery_soft_speed_cap)
+            if hard_recovery_active and states[0] > cap:
+                speed_cmd = min(
+                    speed_cmd,
+                    cap - (states[0] - cap))
+            else:
+                speed_cmd = min(speed_cmd, cap)
+        speed_cmd = self._apply_wall_guard_to_speed(
+            speed_cmd, states[0], wall_guard)
 
         # ── 6. Publish drive ─────────────────────���──────────────────
         self._publish_drive(self.U1, speed_cmd)
 
         # ── 7. Visualization ────────────────────────────────────────
         self._publish_ref_marker(r, hz)
+        self._publish_pred_marker(pred_aug, hz)
 
         # ── 8. Logging ─────────────────────────────────────────────
-        self._log_row('ok', states, wp_idx, r, speed_cmd=speed_cmd,
+        self._log_row('ok', states, wp_idx, r, pred_aug=pred_aug, speed_cmd=speed_cmd,
                       ref_speed=ref_speed, mpc_speed=mpc_speed,
                       t_build=t_build, t_solve=t_solve)
         self.iteration += 1
@@ -459,6 +838,7 @@ class LPVMPCNode(Node):
                 f'[iter={self.iteration}] wp={wp_idx}  '
                 f'v={states[0]:.2f} m/s  steer={math.degrees(self.U1):.1f}deg  '
                 f'accel={self.U2:.2f}  speed_cmd={speed_cmd:.2f}  '
+                f'wall={self._last_wall_clearance:.2f}/{self._last_wall_speed_cap:.2f}  '
                 f'slack={self._last_slack:.3f}')
             n = max(self._prof_count, 1)
             self.get_logger().info(
@@ -679,6 +1059,14 @@ class LPVMPCNode(Node):
         'wall_t', 'sim_t', 'iter', 'lap', 'wp_idx', 'status',
         # measured state
         'x_dot', 'y_dot', 'psi', 'psi_dot', 'X', 'Y', 'slip_deg',
+        # lidar wall clearance from /scan
+        'scan_front_m', 'scan_left_m', 'scan_right_m',
+        'scan_front_min_m', 'scan_left_min_m', 'scan_right_min_m',
+        'scan_min_m', 'scan_age_s',
+        'obstacle_front_m', 'obstacle_x_m', 'obstacle_y_m',
+        'obstacle_bearing_deg',
+        'wall_clearance_m', 'wall_speed_cap', 'wall_limit_active',
+        'wall_limit_hard', 'wall_source',
         # reference (first horizon step)
         'ref_vx', 'ref_psi', 'ref_X', 'ref_Y',
         # tracking errors
@@ -691,6 +1079,9 @@ class LPVMPCNode(Node):
         'speed_cmd', 'ref_speed_ff', 'mpc_speed',
         # timing (ms)
         't_build_ms', 't_solve_ms',
+        # full horizons as space-separated scalar series
+        'ref_horizon_vx', 'ref_horizon_psi', 'ref_horizon_X', 'ref_horizon_Y',
+        'pred_horizon_vx', 'pred_horizon_psi', 'pred_horizon_X', 'pred_horizon_Y',
     ]
 
     def _init_csv_log(self):
@@ -722,7 +1113,7 @@ class LPVMPCNode(Node):
             self._csv_file = None
             self._csv_writer = None
 
-    def _log_row(self, status, states, wp_idx=-1, r=None,
+    def _log_row(self, status, states, wp_idx=-1, r=None, pred_aug=None,
                  speed_cmd=float('nan'), ref_speed=float('nan'),
                  mpc_speed=float('nan'), t_build=float('nan'),
                  t_solve=float('nan')):
@@ -736,6 +1127,7 @@ class LPVMPCNode(Node):
         nan = float('nan')
         x_dot, y_dot, psi, psi_dot, X, Y = (float(v) for v in states)
         slip = math.degrees(math.atan2(y_dot, x_dot)) if abs(x_dot) > 1e-3 else 0.0
+        scan = self._scan_metrics_for_log()
 
         if r is not None:
             ref_vx, ref_psi, ref_X, ref_Y = (float(r[i]) for i in range(4))
@@ -759,6 +1151,20 @@ class LPVMPCNode(Node):
             err_v = err_psi = err_X = err_Y = nan
             pos_err = lat_err = lon_err = sq_err_v = sq_pos = nan
 
+        ref_horizon_vx = ref_horizon_psi = ref_horizon_X = ref_horizon_Y = ''
+        pred_horizon_vx = pred_horizon_psi = pred_horizon_X = pred_horizon_Y = ''
+        if r is not None:
+            ref_horizon_vx = self._format_horizon_series(r, 0, self.outputs)
+            ref_horizon_psi = self._format_horizon_series(r, 1, self.outputs)
+            ref_horizon_X = self._format_horizon_series(r, 2, self.outputs)
+            ref_horizon_Y = self._format_horizon_series(r, 3, self.outputs)
+        if pred_aug is not None:
+            n_aug = 6 + self.inputs
+            pred_horizon_vx = self._format_horizon_series(pred_aug, 0, n_aug)
+            pred_horizon_psi = self._format_horizon_series(pred_aug, 2, n_aug)
+            pred_horizon_X = self._format_horizon_series(pred_aug, 4, n_aug)
+            pred_horizon_Y = self._format_horizon_series(pred_aug, 5, n_aug)
+
         n = max(self._n_log, 1)
         mse_v = self._sse_v / n
         mse_pos = self._sse_pos / n
@@ -770,6 +1176,15 @@ class LPVMPCNode(Node):
             R(time.perf_counter() - self._t0), R(self.get_clock().now().nanoseconds * 1e-9),
             self.iteration, self.nr_laps, wp_idx, status,
             R(x_dot), R(y_dot), R(psi), R(psi_dot), R(X), R(Y), R(slip, 3),
+            R(scan['front']), R(scan['left']), R(scan['right']),
+            R(scan['front_min']), R(scan['left_min']), R(scan['right_min']),
+            R(scan['min']), R(scan['age']),
+            R(scan['obstacle_front']), R(scan['obstacle_x']), R(scan['obstacle_y']),
+            R(math.degrees(scan['obstacle_bearing'])
+              if math.isfinite(scan['obstacle_bearing']) else nan, 3),
+            R(self._last_wall_clearance), R(self._last_wall_speed_cap),
+            int(self._last_wall_limit_active), int(self._last_wall_limit_hard),
+            self._last_wall_source,
             R(ref_vx), R(ref_psi), R(ref_X), R(ref_Y),
             R(err_v), R(math.degrees(err_psi) if r is not None else nan, 3),
             R(err_X), R(err_Y), R(pos_err), R(lat_err), R(lon_err),
@@ -778,6 +1193,8 @@ class LPVMPCNode(Node):
             R(float(self.du[0][0])), R(float(self.du[1][0])),
             R(speed_cmd), R(ref_speed), R(mpc_speed),
             R(t_build * 1e3, 3), R(t_solve * 1e3, 3),
+            ref_horizon_vx, ref_horizon_psi, ref_horizon_X, ref_horizon_Y,
+            pred_horizon_vx, pred_horizon_psi, pred_horizon_X, pred_horizon_Y,
         ]
         self._csv_writer.writerow(row)
         # flush every ~0.4 s so a Ctrl-C / crash keeps almost all the data
@@ -785,6 +1202,13 @@ class LPVMPCNode(Node):
         if self._log_flush_ctr >= 20:
             self._csv_file.flush()
             self._log_flush_ctr = 0
+
+    @staticmethod
+    def _format_horizon_series(values, offset, stride, precision=4):
+        arr = np.asarray(values).reshape(-1)
+        return ' '.join(
+            f'{float(arr[i]):.{precision}f}'
+            for i in range(offset, arr.size, stride))
 
     def _close_log(self):
         """Flush + close the CSV and print a run summary."""
@@ -816,7 +1240,10 @@ class LPVMPCNode(Node):
     def _publish_waypoints_marker(self):
         m = Marker()
         m.header.frame_id = 'map'
+        m.ns = 'lpv_mpc_waypoints'
+        m.action = Marker.ADD
         m.type = Marker.POINTS
+        m.pose.orientation.w = 1.0
         m.color.g = 0.75
         m.color.a = 1.0
         m.scale.x = 0.05
@@ -833,7 +1260,10 @@ class LPVMPCNode(Node):
         m = Marker()
         m.header.frame_id = 'map'
         m.header.stamp = self.get_clock().now().to_msg()
+        m.ns = 'lpv_mpc_ref_horizon'
+        m.action = Marker.ADD
         m.type = Marker.LINE_STRIP
+        m.pose.orientation.w = 1.0
         m.color.b = 0.9
         m.color.a = 1.0
         m.scale.x = 0.06
@@ -844,6 +1274,29 @@ class LPVMPCNode(Node):
                 y=float(r[self.outputs * k + 3]),
                 z=0.2))
         self.vis_ref_pub.publish(m)
+
+    def _publish_pred_marker(self, pred_aug, hz):
+        m = Marker()
+        m.header.frame_id = 'map'
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.ns = 'lpv_mpc_predicted_horizon'
+        m.action = Marker.ADD
+        m.type = Marker.LINE_STRIP
+        m.pose.orientation.w = 1.0
+        m.color.r = 1.0
+        m.color.g = 0.35
+        m.color.a = 1.0
+        m.scale.x = 0.07
+        m.id = 2
+
+        n_aug = 6 + self.inputs
+        for k in range(hz):
+            base = n_aug * k
+            m.points.append(Point(
+                x=float(pred_aug[base + 4]),
+                y=float(pred_aug[base + 5]),
+                z=0.28))
+        self.vis_pred_pub.publish(m)
 
 
 def main(args=None):

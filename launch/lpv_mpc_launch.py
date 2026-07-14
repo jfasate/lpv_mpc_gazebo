@@ -34,7 +34,7 @@ def generate_launch_description():
         output='screen',
         # config first, then the resolved log_dir override so every run lands
         # in the source-tree log/ folder (enable_csv_log stays YAML-controlled).
-        parameters=[config, {'log_dir': log_dir}],
+        parameters=[config, {'log_dir': log_dir, 'config_file': config}],
     )
 
     return LaunchDescription([lpv_mpc_node])

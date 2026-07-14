@@ -35,6 +35,9 @@ class SupportFilesF1Tenth:
         lr = p.get('lr', 0.17145)           # CG to rear axle [m]
         Ts = p.get('Ts', 0.02)              # sample time [s]
         mju = p.get('mju', 0.015)           # rolling resistance coefficient
+        steer_rate_limit = p.get('steer_rate_limit', 3.2)  # [rad/s]
+        d_delta_max = p.get('d_delta_max', steer_rate_limit * Ts)
+        d_a_max = p.get('d_a_max', 0.5)      # accel-input change [m/s^2 per step]
 
         # MPC tuning
         outputs = 4   # [x_dot, psi, X, Y]
@@ -53,6 +56,7 @@ class SupportFilesF1Tenth:
         self.constants = {
             'g': g, 'm': m, 'Iz': Iz, 'Cf': Cf, 'Cr': Cr,
             'lf': lf, 'lr': lr, 'Ts': Ts, 'mju': mju,
+            'd_delta_max': d_delta_max, 'd_a_max': d_a_max,
             'Q': Q, 'S': S, 'R': R,
             'outputs': outputs, 'inputs': inputs, 'hz': hz,
         }
@@ -78,6 +82,8 @@ class SupportFilesF1Tenth:
         hz = self.constants['hz']
         inputs = self.constants['inputs']
         n_out = self.constants['outputs']
+        d_delta_max = self.constants['d_delta_max']
+        d_a_max = self.constants['d_a_max']
 
         n_states = 6
         n_aug = n_states + inputs        # 8
@@ -122,8 +128,6 @@ class SupportFilesF1Tenth:
                               n_aug * i:n_aug * i + n_aug] = C_asterisk
 
         # Input-rate limits (constant per sample): [d_delta, d_a].
-        d_delta_max = np.pi / 90     # ~0.035 rad/step
-        d_a_max = 0.5                # m/s^2 per step
         ub_global = np.empty(inputs * hz)
         ub_global[0::2] = d_delta_max
         ub_global[1::2] = d_a_max

@@ -10,7 +10,7 @@ lpv_mpc_node:
     reference_csv: 'test_worldv5_optimize'
     # Lowered to 0.4: run the whole lap inside the linear-tire regime (slip small)
     # so the MPC's model is valid and the car actually tracks. Raise once stable.
-    speed_scale: 0.40      # Scale waypoint speeds (start conservative, increase once stable)
+    speed_scale: 1.00      # Scale waypoint speeds (increase in small steps once stable)
 
     # Drive-speed command (velocity setpoint sent to the sim servo).
     #   speed_ff_blend    : 0 = pure MPC accel-integration, 1 = pure raceline
@@ -19,7 +19,7 @@ lpv_mpc_node:
     #   cmd_accel_horizon : integration time [s] for the MPC accel term. Was
     #                       hardcoded to Ts=0.02 (only +0.06 m/s/tick, which
     #                       starved the servo); 0.15 gives up to +0.45 m/s/tick.
-    speed_ff_blend: 0.7
+    speed_ff_blend: 0.0
     cmd_accel_horizon: 0.15
 
     # Brake-lookahead: command the highest speed that can still brake (at
@@ -29,6 +29,21 @@ lpv_mpc_node:
     # to brake earlier/more conservatively.
     speed_lookahead_time: 1.2
     speed_lookahead_decel: 4.0
+
+    # Recovery guard: current-state and prediction-based safety caps. The
+    # predictive guard catches cases where current error is still small but the
+    # MPC horizon is already diverging from the raceline.
+    recovery_lat_err: 0.8
+    recovery_heading_err_deg: 30.0
+    recovery_hard_lat_err: 2.0
+    recovery_hard_heading_err_deg: 60.0
+    recovery_soft_speed_cap: 4.8
+    recovery_speed_cap: 3.4
+    recovery_soft_accel_cap: 1.0
+    recovery_accel_cap: 0.0
+    predictive_recovery_lat_growth: 2.0
+    predictive_recovery_lat_end: 3.5
+    predictive_recovery_heading_err_deg: 90.0
 
     # Soft state constraints: slack on the state-limit rows so the QP is ALWAYS
     # feasible -> the controller never freezes the steering mid-slide. Slack is
@@ -51,7 +66,47 @@ lpv_mpc_node:
 
     # ROS topics
     odom_topic: '/ego_racecar/odom'
+    scan_topic: '/scan'
     drive_topic: '/drive'
+
+    # /scan wall-clearance logging. The lidar scan is centered on the vehicle
+    # front in ROS LaserScan convention: front=0 deg, left=+90 deg, right=-90 deg.
+    scan_front_angle_deg: 0.0
+    scan_left_angle_deg: 90.0
+    scan_right_angle_deg: -90.0
+    scan_sector_width_deg: 10.0
+
+    # Wall/object avoidance guard. MPPI handles walls with a distance-field
+    # soft-hinge cost; this LPV-MPC version uses the same idea as a deterministic
+    # LiDAR clearance speed cap. Outside the soft clearance it does nothing.
+    # Inside the soft/hard band it ramps speed from wall_soft_speed_cap to
+    # wall_hard_speed_cap and prevents further acceleration. At/below the hard
+    # clearance it commands extra braking if the car is still above the cap.
+    wall_avoidance_enabled: true
+    wall_soft_clearance: 0.75
+    wall_hard_clearance: 0.40
+    wall_front_soft_clearance: 1.50
+    wall_front_hard_clearance: 0.60
+    wall_soft_speed_cap: 4.8
+    wall_hard_speed_cap: 2.0
+    wall_accel_cap: 0.0
+    wall_brake_gain: 1.0
+    wall_scan_max_age: 0.20
+
+    # Forward-corridor obstacle detector. LiDAR points inside this corridor are
+    # treated like MPPI keep-out costs: speed is capped when an object is close
+    # in distance or time-to-collision. This catches objects/walls that are not
+    # exactly on the single front beam.
+    obstacle_avoidance_enabled: true
+    obstacle_forward_angle_deg: 55.0
+    obstacle_corridor_width: 0.75
+    obstacle_soft_distance: 3.00
+    obstacle_hard_distance: 0.90
+    obstacle_soft_speed_cap: 6.8
+    obstacle_hard_speed_cap: 1.5
+    obstacle_ttc_soft: 1.35
+    obstacle_ttc_hard: 0.75
+    obstacle_brake_gain: 0.6
 
     # QP solver ('cvxopt', 'osqp', 'ecos', 'scs')
     qp_solver: 'osqp'
@@ -61,7 +116,7 @@ lpv_mpc_node:
 
     # MPC timing
     Ts: 0.02              # Sample time [s] (50 Hz control loop)
-    hz: 30                # Prediction horizon [steps] (30 * 0.02s = 0.6s)
+    hz: 60                # Prediction horizon [steps] (60 * 0.02s = 1.2s)
 
     # F1Tenth vehicle parameters (from f110_gym simulator)
     m: 3.74               # Mass [kg]
@@ -71,6 +126,8 @@ lpv_mpc_node:
     lf: 0.15875           # CG to front axle [m]
     lr: 0.17145           # CG to rear axle [m]
     mju: 0.015            # Rolling resistance coefficient
+    steer_rate_limit: 3.2 # Steering actuator rate [rad/s], matches dynamics plant
+    d_a_max: 0.5          # MPC accel-input change limit [m/s^2 per control step]
 
     # MPC cost weights (diagonal entries)
     #   Q, S: output weights for [x_dot, psi, X, Y]
