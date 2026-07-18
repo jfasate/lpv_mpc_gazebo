@@ -36,6 +36,41 @@ lpv_mpc_node:
     speed_lookahead_time: 1.2
     speed_lookahead_decel: 4.0
 
+    # Brake controller (ported from the Frenet controller; replaces the old
+    # reverse-speed hack). Braking deceleration is
+    #   decel = brake_kp*(over_speed - brake_deadband) + brake_kff*(MPC requested decel)
+    # slew-rate-limited to brake_slew_rate so it ramps smoothly instead of a
+    # reverse-thrust step that jerked the dynamic model. It only ever lowers the
+    # speed command. Tuning:
+    #   brake_kp     up  -> firmer braking for a given over-speed
+    #   brake_kff    up  -> brakes earlier on the MPC's own decel intent
+    #   brake_slew_rate down -> smoother/gentler brake onset (but engages later)
+    #   brake_decel_max     -> hard cap; keep < the plant's ~9.5 m/s^2 limit
+    brake_kp: 3.0
+    brake_kff: 1.0
+    brake_deadband: 0.15
+    brake_slew_rate: 40.0
+    brake_decel_max: 8.0
+
+    # Curvature-based speed cap (grip limit). The per-waypoint target speed is
+    #   v_curv = curvature_speed_scale * sqrt(curvature_lateral_accel / |kappa|)
+    # and in mode 'cap' the reference used is min(csv_speed, v_curv) -- i.e. the
+    # raceline speed, but never faster than the a_lat grip budget allows in a
+    # corner. Built once at load. This raceline already implies ~6.7 m/s^2 mean
+    # lateral accel (p90 ~11.5), so a_lat ~9 trims only the most aggressive
+    # corners; lower a_lat = more conservative (binds more), higher = looser.
+    #   mode: off | cap | replace     kappa_source: csv | geometry
+    curvature_speed_mode: cap
+    curvature_lateral_accel: 9.0
+    curvature_speed_scale: 1.0
+    curvature_straight_speed: 0.0     # <=0 -> no straight cap
+    curvature_min_speed: 0.0          # <=0 -> use min_ref_speed floor
+    curvature_epsilon: 0.0001
+    curvature_kappa_source: csv
+    curvature_accel_delta: 2.0        # m/s per m, forward smoothing rate
+    curvature_decel_delta: 4.0        # m/s per m, backward smoothing rate
+    curvature_smoothing_passes: 2
+
     # Recovery guard: current-state and prediction-based safety caps. The
     # predictive guard catches cases where current error is still small but the
     # MPC horizon is already diverging from the raceline.

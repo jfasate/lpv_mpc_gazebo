@@ -70,6 +70,32 @@ class LPVMPCNode(Node):
         # at a corner too hot (the trigger of the lap-1 spin-out).
         self.declare_parameter('speed_lookahead_time', 1.2)
         self.declare_parameter('speed_lookahead_decel', 4.0)
+        # Dedicated brake controller (ported from the Frenet controller), replacing
+        # the old reverse-speed hack. Braking deceleration is
+        #   decel = brake_kp*(over_speed - deadband) + brake_kff*(MPC requested decel)
+        # slew-rate-limited so it ramps smoothly instead of stepping the setpoint
+        # (a jerk that can break the rear loose on the dynamic model). decel_max
+        # stays under the plant's ~9.5 m/s^2 longitudinal limit.
+        self.declare_parameter('brake_kp', 3.0)          # m/s^2 per m/s over-speed
+        self.declare_parameter('brake_kff', 1.0)         # gain on MPC requested decel
+        self.declare_parameter('brake_deadband', 0.15)   # m/s over-speed ignore band
+        self.declare_parameter('brake_slew_rate', 40.0)  # m/s^3 max decel ramp rate
+        self.declare_parameter('brake_decel_max', 8.0)   # m/s^2 brake decel cap
+        # Curvature-based speed cap: limit the reference speed to what keeps
+        # lateral accel within curvature_lateral_accel on each corner:
+        #   v_curv = curvature_speed_scale * sqrt(a_lat / |kappa|).
+        # mode 'cap' uses min(csv_speed, v_curv) (never exceed the grip limit),
+        # 'replace' uses v_curv alone, 'off' keeps the CSV speed. Built once at load.
+        self.declare_parameter('curvature_speed_mode', 'cap')      # off | cap | replace
+        self.declare_parameter('curvature_lateral_accel', 9.0)     # m/s^2 grip budget
+        self.declare_parameter('curvature_speed_scale', 1.0)
+        self.declare_parameter('curvature_straight_speed', 0.0)    # <=0 -> no straight cap
+        self.declare_parameter('curvature_min_speed', 0.0)         # <=0 -> use min_ref_speed
+        self.declare_parameter('curvature_epsilon', 1.0e-4)        # min |kappa| (avoid /0)
+        self.declare_parameter('curvature_kappa_source', 'csv')    # csv | geometry
+        self.declare_parameter('curvature_accel_delta', 2.0)       # m/s per m fwd smoothing
+        self.declare_parameter('curvature_decel_delta', 4.0)       # m/s per m bwd smoothing
+        self.declare_parameter('curvature_smoothing_passes', 2)
         self.declare_parameter('recovery_lat_err', 0.8)
         self.declare_parameter('recovery_heading_err_deg', 30.0)
         self.declare_parameter('recovery_hard_lat_err', 2.0)
@@ -160,6 +186,24 @@ class LPVMPCNode(Node):
         self.cmd_accel_horizon = self.get_parameter('cmd_accel_horizon').value
         self.speed_lookahead_time = self.get_parameter('speed_lookahead_time').value
         self.speed_lookahead_decel = self.get_parameter('speed_lookahead_decel').value
+        self.brake_kp = self.get_parameter('brake_kp').value
+        self.brake_kff = self.get_parameter('brake_kff').value
+        self.brake_deadband = self.get_parameter('brake_deadband').value
+        self.brake_slew_rate = self.get_parameter('brake_slew_rate').value
+        self.brake_decel_max = self.get_parameter('brake_decel_max').value
+        self.curvature_speed_mode = str(
+            self.get_parameter('curvature_speed_mode').value).strip().lower()
+        self.curvature_lateral_accel = self.get_parameter('curvature_lateral_accel').value
+        self.curvature_speed_scale = self.get_parameter('curvature_speed_scale').value
+        self.curvature_straight_speed = self.get_parameter('curvature_straight_speed').value
+        self.curvature_min_speed = self.get_parameter('curvature_min_speed').value
+        self.curvature_epsilon = self.get_parameter('curvature_epsilon').value
+        self.curvature_kappa_source = str(
+            self.get_parameter('curvature_kappa_source').value).strip().lower()
+        self.curvature_accel_delta = self.get_parameter('curvature_accel_delta').value
+        self.curvature_decel_delta = self.get_parameter('curvature_decel_delta').value
+        self.curvature_smoothing_passes = int(
+            self.get_parameter('curvature_smoothing_passes').value)
         self.recovery_lat_err = self.get_parameter('recovery_lat_err').value
         self.recovery_heading_err = math.radians(
             self.get_parameter('recovery_heading_err_deg').value)
@@ -335,6 +379,11 @@ class LPVMPCNode(Node):
         # Derived from CSV data so it adapts to any track / speed_scale.
         self.min_ref_speed = max(self.wp_vx.min() * self.speed_scale, 2.0)
 
+        # Per-waypoint target speed = CSV speed capped by the curvature/grip limit
+        # (see _build_speed_profile). Both the horizon reference and the brake
+        # lookahead read self.wp_v_target instead of the raw CSV speed.
+        self._build_speed_profile()
+
         self.get_logger().info(
             f'Loaded {self.n_waypoints} waypoints, avg spacing={self.ds:.4f} m, '
             f'speed range [{self.wp_vx.min():.1f}, {self.wp_vx.max():.1f}] m/s, '
@@ -368,6 +417,7 @@ class LPVMPCNode(Node):
         self._last_wall_limit_hard = False
         self._last_wall_source = ''
         self._last_speed_ff_blend = self.speed_ff_blend
+        self._brake_decel = 0.0   # slew-limited brake deceleration state [m/s^2]
         self.iteration = 0
 
         # ── Warm-started OSQP solver state ──────────────────────────
@@ -410,12 +460,8 @@ class LPVMPCNode(Node):
 
         self.drive_pub = self.create_publisher(AckermannDriveStamped, drive_topic, 1)
 
-        self.vis_waypoints_pub = self.create_publisher(Marker, '/lpv_mpc_gazebo/waypoints', 1)
         self.vis_ref_pub = self.create_publisher(Marker, '/lpv_mpc_gazebo/ref_traj', 1)
         self.vis_pred_pub = self.create_publisher(Marker, '/lpv_mpc_gazebo/pred_path', 1)
-
-        # Publish waypoints once
-        self._publish_waypoints_marker()
 
         # Control timer at 1/Ts Hz
         self.control_timer = self.create_timer(self.Ts, self.control_loop)
@@ -428,8 +474,8 @@ class LPVMPCNode(Node):
         self.get_logger().info(f'LPV-MPC code file: {__file__}')
         self.get_logger().info(f'LPV-MPC config file: {config_file}')
         self.get_logger().info(
-            'RViz topics: /lpv_mpc_gazebo/waypoints, '
-            '/lpv_mpc_gazebo/ref_traj, /lpv_mpc_gazebo/pred_path')
+            'RViz topics: /lpv_mpc_gazebo/ref_traj, '
+            '/lpv_mpc_gazebo/pred_path')
 
         # ── Per-run CSV debug log ───────────────────────────────────
         self._init_csv_log()
@@ -650,6 +696,24 @@ class LPVMPCNode(Node):
                           else self.wall_brake_gain)
             return min(speed_cmd, cap - brake_gain * (current_speed - cap))
         return min(speed_cmd, cap)
+
+    def _slew_brake_decel(self, target_decel):
+        """Rate-limit the braking deceleration [m/s^2] so it ramps smoothly
+        instead of stepping. Ported from the Frenet controller's brake-current
+        slew limiter: a step change in braking is a jerk that can break the rear
+        loose on the dynamic model. Returns the slewed decel."""
+        target = max(0.0, min(self.brake_decel_max, float(target_decel)))
+        if self.brake_slew_rate <= 0.0:
+            self._brake_decel = target
+            return target
+        max_delta = self.brake_slew_rate * self.Ts
+        prev = self._brake_decel
+        if target > prev:
+            cmd = min(target, prev + max_delta)
+        else:
+            cmd = max(target, prev - max_delta)
+        self._brake_decel = cmd
+        return cmd
 
     def _adaptive_speed_ff_blend(self, lat_err, heading_err, pred_lat_growth,
                                  pred_lat_end, pred_heading_peak, slip,
@@ -894,22 +958,38 @@ class LPVMPCNode(Node):
         # first-horizon-step x_dot reference — already scaled by speed_scale
         # and floored by min_ref_speed. The MPC accel term is integrated over
         # cmd_accel_horizon (>> Ts) and blended in via speed_ff_blend.
-        # When decelerating, use reverse (negative speed) to brake harder: the
-        # simulator treats negative speed as reverse thrust for strong braking.
+        # Braking is handled by a dedicated slew-limited decel controller below
+        # (ported from the Frenet controller), replacing the old reverse-speed
+        # hack that stepped the setpoint and jerked the dynamic model.
         ref_speed = ff_ref_speed
         mpc_speed = states[0] + self.U2 * self.cmd_accel_horizon
-        if self.U2 < -0.5 and states[0] > ref_speed:
-            # Car is faster than reference → brake hard using reverse
-            speed_cmd = ref_speed - (states[0] - ref_speed)
-            speed_ff_blend = 0.0
+
+        # Forward speed command: blend of the profiled / brake-lookahead reference
+        # and the MPC-integrated speed.
+        slip = math.atan2(states[1], states[0]) if abs(states[0]) > 1e-3 else 0.0
+        speed_ff_blend = self._adaptive_speed_ff_blend(
+            lat_err, heading_err, pred_lat_growth, pred_lat_end,
+            pred_heading_peak, slip, wall_guard, recovery_active,
+            hard_recovery_active)
+        speed_cmd = (speed_ff_blend * ref_speed
+                     + (1.0 - speed_ff_blend) * mpc_speed)
+
+        # Dedicated brake controller (replaces the reverse-speed hack):
+        #   decel = brake_kp*(over_speed - deadband) + brake_kff*(MPC requested decel)
+        # slew-rate-limited, only ever LOWERS the command. The plant turns the
+        # resulting (possibly reverse) setpoint into a braking force.
+        over_speed = states[0] - ref_speed
+        requested_decel = max(0.0, -self.U2)
+        decel_raw = (self.brake_kp * max(0.0, over_speed - self.brake_deadband)
+                     + self.brake_kff * requested_decel)
+        if decel_raw > 0.0:
+            decel = self._slew_brake_decel(decel_raw)
+            brake_speed = states[0] - decel * self.cmd_accel_horizon
+            if brake_speed < speed_cmd:
+                speed_cmd = brake_speed
+                speed_ff_blend = 0.0
         else:
-            slip = math.atan2(states[1], states[0]) if abs(states[0]) > 1e-3 else 0.0
-            speed_ff_blend = self._adaptive_speed_ff_blend(
-                lat_err, heading_err, pred_lat_growth, pred_lat_end,
-                pred_heading_peak, slip, wall_guard, recovery_active,
-                hard_recovery_active)
-            speed_cmd = (speed_ff_blend * ref_speed
-                         + (1.0 - speed_ff_blend) * mpc_speed)
+            self._slew_brake_decel(0.0)
         self._last_speed_ff_blend = speed_ff_blend
         if recovery_active:
             cap = (self.recovery_speed_cap if hard_recovery_active
@@ -1074,6 +1154,81 @@ class LPVMPCNode(Node):
     # ────────────────────────────────────��───────────────────────���───
     #  Reference trajectory builder
     # ─────────────────────────────────────────────────���──────────────
+    def _kappa_from_geometry(self):
+        """Per-waypoint |curvature| = |d(psi)/d(s)| from the recomputed headings.
+        Fallback when the CSV has no usable kappa column."""
+        return np.abs(np.gradient(np.unwrap(self.wp_psi), self.wp_s))
+
+    def _smooth_speed_profile(self, speed):
+        """Forward/backward accel-decel rate-limit passes over the closed loop so
+        the target profile is drivable (no instantaneous speed step at corner
+        entry). Mirrors the Frenet controller's rate_limit_closed_speed_profile."""
+        profile = np.asarray(speed, dtype=float).copy()
+        n = profile.size
+        if n < 3 or self.curvature_smoothing_passes <= 0:
+            return profile
+        accel_step = self.curvature_accel_delta * self.ds
+        decel_step = self.curvature_decel_delta * self.ds
+        if accel_step <= 0.0 or decel_step <= 0.0:
+            return profile
+        for _ in range(self.curvature_smoothing_passes):
+            for i in range(1, n):
+                profile[i] = min(profile[i], profile[i - 1] + accel_step)
+            profile[0] = min(profile[0], profile[-1] + accel_step)
+            for i in range(n - 2, -1, -1):
+                profile[i] = min(profile[i], profile[i + 1] + decel_step)
+            profile[-1] = min(profile[-1], profile[0] + decel_step)
+        return profile
+
+    def _build_speed_profile(self):
+        """Build self.wp_v_target: the per-waypoint speed the controller aims for.
+
+        v_curv = scale * sqrt(a_lat / |kappa|) is the fastest a corner of curvature
+        kappa can be taken within the a_lat grip budget. In 'cap' mode the target is
+        min(csv_speed, v_curv) — the raceline speed, never exceeding the grip limit;
+        'replace' uses v_curv alone; 'off' keeps the CSV speed. The result is
+        floored at min_ref_speed and rate-limit smoothed. Built once at load.
+        """
+        v_csv = self.wp_vx * self.speed_scale
+        floor = (self.curvature_min_speed if self.curvature_min_speed > 0.0
+                 else self.min_ref_speed)
+
+        if self.curvature_speed_mode == 'off':
+            self.wp_v_target = np.maximum(v_csv, floor)
+            self.get_logger().info('Curvature speed cap: OFF (using CSV speed)')
+            return
+
+        # curvature per waypoint (CSV column is smooth; geometry as fallback)
+        if (self.curvature_kappa_source == 'csv'
+                and self.waypoints.shape[1] > 4
+                and self.waypoints.shape[0] == self.n_waypoints):
+            kappa = np.abs(self.waypoints[:, 4])
+        else:
+            kappa = self._kappa_from_geometry()
+
+        straight = (self.curvature_straight_speed
+                    if self.curvature_straight_speed > 0.0 else 1.0e3)
+        v_curv = self.curvature_speed_scale * np.sqrt(
+            self.curvature_lateral_accel / np.maximum(kappa, self.curvature_epsilon))
+        v_curv = np.minimum(v_curv, straight)
+
+        if self.curvature_speed_mode == 'replace':
+            v_target = v_curv
+        else:  # 'cap' (default): never exceed the grip limit
+            v_target = np.minimum(v_csv, v_curv)
+
+        v_target = np.maximum(v_target, floor)
+        v_target = self._smooth_speed_profile(v_target)
+        self.wp_v_target = np.maximum(v_target, floor)
+
+        binds = int(np.sum(self.wp_v_target < v_csv - 0.05))
+        self.get_logger().info(
+            f'Curvature speed cap: mode={self.curvature_speed_mode} '
+            f'a_lat={self.curvature_lateral_accel:.1f} kappa={self.curvature_kappa_source}  '
+            f'target [{self.wp_v_target.min():.1f}, {self.wp_v_target.max():.1f}] '
+            f'mean={self.wp_v_target.mean():.2f} m/s  caps {binds}/{self.n_waypoints} '
+            f'({100.0 * binds / max(1, self.n_waypoints):.0f}%) below CSV')
+
     def _build_reference(self, states, wp_idx, hz):
         """Build the reference signal vector r for the MPC horizon.
 
@@ -1102,7 +1257,7 @@ class LPVMPCNode(Node):
             # Advance proportional to predicted travel distance
             advance = lookahead_indices + k * indices_per_step
             idx = (wp_idx + int(round(advance))) % self.n_waypoints
-            ref_vx = max(self.wp_vx[idx] * self.speed_scale, self.min_ref_speed)
+            ref_vx = self.wp_v_target[idx]   # grip-capped target (see _build_speed_profile)
             ref_psi = self.wp_psi[idx]
 
             # Adjust psi reference to be close to current psi (avoid 2*pi jumps)
@@ -1133,7 +1288,7 @@ class LPVMPCNode(Node):
         horizon_m = max(v, 1.0) * self.speed_lookahead_time
         span = int(max(1, round(horizon_m / self.ds)))
         idxs = (wp_idx + np.arange(span)) % self.n_waypoints
-        v_prof = self.wp_vx[idxs] * self.speed_scale        # upcoming target speeds
+        v_prof = self.wp_v_target[idxs]                     # upcoming grip-capped targets
         dist = np.arange(span) * self.ds                    # distance to each point
         # Max speed now that still allows braking to v_prof[i] over dist[i]:
         #   v_now^2 <= v_prof[i]^2 + 2 * a_brake * dist[i]
@@ -1348,25 +1503,6 @@ class LPVMPCNode(Node):
         msg.drive.steering_angle = float(steering)
         msg.drive.speed = float(speed)
         self.drive_pub.publish(msg)
-
-    def _publish_waypoints_marker(self):
-        m = Marker()
-        m.header.frame_id = 'map'
-        m.ns = 'lpv_mpc_waypoints'
-        m.action = Marker.ADD
-        m.type = Marker.POINTS
-        m.pose.orientation.w = 1.0
-        m.color.g = 0.75
-        m.color.a = 1.0
-        m.scale.x = 0.05
-        m.scale.y = 0.05
-        m.id = 0
-        for i in range(self.n_waypoints):
-            m.points.append(Point(
-                x=float(self.wp_xy[i, 0]),
-                y=float(self.wp_xy[i, 1]),
-                z=0.1))
-        self.vis_waypoints_pub.publish(m)
 
     def _publish_ref_marker(self, r, hz):
         m = Marker()
