@@ -98,8 +98,10 @@ class LPVMPCNode(Node):
         self.declare_parameter('curvature_smoothing_passes', 2)
         self.declare_parameter('recovery_lat_err', 0.8)
         self.declare_parameter('recovery_heading_err_deg', 30.0)
+        self.declare_parameter('recovery_slip_err_deg', 8.0)
         self.declare_parameter('recovery_hard_lat_err', 2.0)
         self.declare_parameter('recovery_hard_heading_err_deg', 60.0)
+        self.declare_parameter('recovery_hard_slip_err_deg', 15.0)
         self.declare_parameter('recovery_soft_speed_cap', 4.8)
         self.declare_parameter('recovery_speed_cap', 3.4)
         self.declare_parameter('recovery_soft_accel_cap', 1.0)
@@ -146,7 +148,7 @@ class LPVMPCNode(Node):
         self.declare_parameter('obstacle_brake_gain', 0.6)
         self.declare_parameter('config_file', '')
         self.declare_parameter('Ts', 0.02)
-        self.declare_parameter('hz', 10)
+        self.declare_parameter('hz', 60)
         self.declare_parameter('m', 3.47)
         self.declare_parameter('Iz', 0.04712)
         self.declare_parameter('Cf', 90.0)
@@ -207,9 +209,13 @@ class LPVMPCNode(Node):
         self.recovery_lat_err = self.get_parameter('recovery_lat_err').value
         self.recovery_heading_err = math.radians(
             self.get_parameter('recovery_heading_err_deg').value)
+        self.recovery_slip_err = math.radians(
+            self.get_parameter('recovery_slip_err_deg').value)
         self.recovery_hard_lat_err = self.get_parameter('recovery_hard_lat_err').value
         self.recovery_hard_heading_err = math.radians(
             self.get_parameter('recovery_hard_heading_err_deg').value)
+        self.recovery_hard_slip_err = math.radians(
+            self.get_parameter('recovery_hard_slip_err_deg').value)
         self.recovery_soft_speed_cap = self.get_parameter('recovery_soft_speed_cap').value
         self.recovery_speed_cap = self.get_parameter('recovery_speed_cap').value
         self.recovery_soft_accel_cap = self.get_parameter('recovery_soft_accel_cap').value
@@ -902,12 +908,15 @@ class LPVMPCNode(Node):
         heading_err = math.atan2(
             math.sin(states[2] - ref_psi),
             math.cos(states[2] - ref_psi))
+        slip = math.atan2(states[1], states[0]) if abs(states[0]) > 1e-3 else 0.0
         recovery_active = (
             abs(lat_err) > self.recovery_lat_err
-            or abs(heading_err) > self.recovery_heading_err)
+            or abs(heading_err) > self.recovery_heading_err
+            or abs(slip) > self.recovery_slip_err)
         hard_recovery_active = (
             abs(lat_err) > self.recovery_hard_lat_err
-            or abs(heading_err) > self.recovery_hard_heading_err)
+            or abs(heading_err) > self.recovery_hard_heading_err
+            or abs(slip) > self.recovery_hard_slip_err)
 
         n_aug = 6 + self.inputs
         pred_lat = []
@@ -966,7 +975,6 @@ class LPVMPCNode(Node):
 
         # Forward speed command: blend of the profiled / brake-lookahead reference
         # and the MPC-integrated speed.
-        slip = math.atan2(states[1], states[0]) if abs(states[0]) > 1e-3 else 0.0
         speed_ff_blend = self._adaptive_speed_ff_blend(
             lat_err, heading_err, pred_lat_growth, pred_lat_end,
             pred_heading_peak, slip, wall_guard, recovery_active,

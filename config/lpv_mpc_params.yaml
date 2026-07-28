@@ -76,8 +76,10 @@ lpv_mpc_node:
     # MPC horizon is already diverging from the raceline.
     recovery_lat_err: 0.8
     recovery_heading_err_deg: 30.0
+    recovery_slip_err_deg: 8.0
     recovery_hard_lat_err: 2.0
     recovery_hard_heading_err_deg: 60.0
+    recovery_hard_slip_err_deg: 15.0
     recovery_soft_speed_cap: 4.8
     recovery_speed_cap: 3.4
     recovery_soft_accel_cap: 1.0
