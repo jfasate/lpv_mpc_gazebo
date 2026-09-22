@@ -4,13 +4,36 @@ lpv_mpc_node:
 
     # ── Reference line: the SINGLE place to choose which CSV to follow ──
     # Bare name resolves to src/csv_data/<name>.csv (or give a full '/...' path).
-    #   'test_worldv5'          - raw centerline (has undrivable hairpins)
-    #   'test_worldv5_optimize' - optimized corner-cut racing line  <-- follow this
+    #   'superspeedway_centerline' - superspeedway centerline  <-- follow this
+    #   'test_worldv5'          - raw centerline (test_worldv5 map)
+    #   'test_worldv5_optimize' - optimized corner-cut racing line
     #   'test_worldv5_mincurv'  - my min-curvature line (parked)
-    reference_csv: 'test_worldv5_optimize'
-    # Lowered to 0.4: run the whole lap inside the linear-tire regime (slip small)
-    # so the MPC's model is valid and the car actually tracks. Raise once stable.
-    speed_scale: 0.90      # Scale waypoint speeds (increase in small steps once stable)
+    reference_csv: 'superspeedway_centerline'
+    # Deploy the neural planner: consume the horizon on /planning/ref_path from an
+    # external generator (neural_generator). Revert to the CSV baseline with:
+    #   git checkout 33d9e5b -- config/lpv_mpc_params.yaml && colcon build --packages-select lpv_mpc_gazebo
+    ref_source: 'csv'
+    ref_generator: 'builtin'
+
+    # ── ref_source: 'topic' behaviour (used by lane_assist camera lane keeping) ──
+    # Values here match what the node previously hardcoded, so nothing changes
+    # until you edit them.
+    ref_path_topic: '/planning/ref_path'
+    # A horizon whose max |vx| is <= this is an explicit HOLD from the planner:
+    # the controller stops the car instead of following a stale reference. The
+    # lane detector publishes vx=0 this way when it goes blind.
+    topic_stop_speed_thresh: 0.05
+    topic_min_ref_speed: 0.0          # open-loop horizon: no speed floor
+    topic_low_speed_mpc_thresh: 0.0
+    topic_startup_speed: 0.4
+    topic_reference_speed_floor: 0.10
+    initialpose_topic: '/initialpose'
+    obstacle_path_aware_enabled: true
+    # superspeedway_centerline has a FLAT vx=1.5 m/s column, and min_ref_speed is
+    # floored at 2.0 m/s (the dynamic bicycle model degenerates below that), so
+    # 1.5*scale < 2.0 -> the whole lap runs at the 2.0 m/s floor and this knob is
+    # inert until scale > 1.33. Left at 1.0 so the yaml doesn't imply otherwise.
+    speed_scale: 1.0       # Scale waypoint speeds (increase in small steps once stable)
 
     # Drive-speed command (velocity setpoint sent to the sim servo).
     #   speed_ff_blend    : 0 = pure MPC accel-integration, 1 = pure raceline
@@ -33,8 +56,8 @@ lpv_mpc_node:
     # speed_lookahead_time seconds ahead. Stops the car arriving at corners too
     # hot. Increase lookahead_time if it still enters corners fast; lower decel
     # to brake earlier/more conservatively.
-    speed_lookahead_time: 1.2
-    speed_lookahead_decel: 4.0
+    speed_lookahead_time: 1.8
+    speed_lookahead_decel: 3.0
 
     # Brake controller (ported from the Frenet controller; replaces the old
     # reverse-speed hack). Braking deceleration is
@@ -61,7 +84,7 @@ lpv_mpc_node:
     # corners; lower a_lat = more conservative (binds more), higher = looser.
     #   mode: off | cap | replace     kappa_source: csv | geometry
     curvature_speed_mode: cap
-    curvature_lateral_accel: 9.0
+    curvature_lateral_accel: 5.5
     curvature_speed_scale: 1.0
     curvature_straight_speed: 0.0     # <=0 -> no straight cap
     curvature_min_speed: 0.0          # <=0 -> use min_ref_speed floor
@@ -90,6 +113,28 @@ lpv_mpc_node:
     predictive_recovery_hard_lat_growth: 2.50
     predictive_recovery_hard_lat_end: 3.00
     predictive_recovery_hard_heading_err_deg: 85.0
+
+    # Cross-track PI on the heading reference. Kills the standing lateral offset
+    # (measured 0.25 m inside on the superspeedway corners): the MPC's position
+    # cost has almost no authority because the linearized X/Y rows are decoupled
+    # from psi, so the error is fed into psi_ref, which does steer the car. The
+    # integral is what makes it zero rather than merely smaller — it winds in
+    # the standing bias the ~5% yaw-model mismatch needs.
+    #   kp up      -> faster pull back to the line (too high = weave)
+    #   ki up      -> kills the residual offset sooner (too high = overshoot)
+    #   max_deg    -> hard cap on the heading bias. Only a guard against absurd
+    #                 aim-off after a reset/teleport: at kp=1.0 the P term alone
+    #                 is already 7 deg at 0.25 m of error, so a tight cap would
+    #                 saturate in normal driving and mask the integral. 15 deg
+    #                 binds at ~0.55 m, which is recovery territory anyway.
+    #   int_max    -> anti-windup clamp on the integral state [m*s]
+    # The loop is e'' + kp*e' + ki*e = 0 (speed cancels), so kp/ki set damping
+    # and bandwidth directly: this pair is zeta=0.71, wn=0.71 rad/s. Retune off
+    # the next run. Set kp and ki both to 0.0 for the old behaviour (A/B).
+    crosstrack_kp: 1.0
+    crosstrack_ki: 0.5
+    crosstrack_int_max: 1.0
+    crosstrack_max_deg: 15.0
 
     # Soft state constraints: slack on the state-limit rows so the QP is ALWAYS
     # feasible -> the controller never freezes the steering mid-slide. Slack is
@@ -128,13 +173,17 @@ lpv_mpc_node:
     # Inside the soft/hard band it ramps speed from wall_soft_speed_cap to
     # wall_hard_speed_cap and prevents further acceleration. At/below the hard
     # clearance it commands extra braking if the car is still above the cap.
+    # superspeedway barriers sit exactly 1.5 m either side of the centerline
+    # (3.0 m corridor). A 1.00 m soft clearance therefore fires at only 0.5 m of
+    # lateral error and then pins wall_accel_cap=0 (car coasts); 0.70/0.40 keeps
+    # the guard for a real wall approach without tripping on normal tracking.
     wall_avoidance_enabled: true
-    wall_soft_clearance: 0.75
+    wall_soft_clearance: 0.70
     wall_hard_clearance: 0.40
     wall_front_soft_clearance: 1.50
     wall_front_hard_clearance: 0.60
-    wall_soft_speed_cap: 4.8
-    wall_hard_speed_cap: 2.0
+    wall_soft_speed_cap: 3.0
+    wall_hard_speed_cap: 1.0
     wall_accel_cap: 0.0
     wall_brake_gain: 1.0
     wall_scan_max_age: 0.20
@@ -143,7 +192,12 @@ lpv_mpc_node:
     # treated like MPPI keep-out costs: speed is capped when an object is close
     # in distance or time-to-collision. This catches objects/walls that are not
     # exactly on the single front beam.
-    obstacle_avoidance_enabled: true
+    # OFF for the superspeedway reference-tracking test: the track has no objects,
+    # and the turns are ~4.9 m radius, so the barrier enters the 0.75 m-wide
+    # forward corridor at ~1.9 m (< obstacle_soft_distance 3.0) on every turn —
+    # a false positive that caps speed and zeroes the accel cap mid-corner.
+    # Re-enable when running the obstacle worlds.
+    obstacle_avoidance_enabled: false
     obstacle_forward_angle_deg: 55.0
     obstacle_corridor_width: 0.75
     obstacle_soft_distance: 3.00
